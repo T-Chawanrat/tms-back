@@ -126,6 +126,54 @@ export const getToWarehouseIdByRecipientDetail = async (conn, recipientDetailId)
   return rows[0].warehouse_id;
 };
 
+export const getPickupAssignedWarehouseId = async (conn, pickupSource, sourceId) => {
+  const sourceQueries = {
+    CUSTOMER: {
+      sql: `
+        SELECT ma.warehouse_id
+        FROM mm_customers c
+        LEFT JOIN mm_master_addresses ma
+          ON ma.subdistrict_id = c.subdistrict_id
+        WHERE c.id = ?
+        LIMIT 1
+      `,
+      notFoundMessage: "ไม่พบข้อมูลเจ้าของงาน",
+      noWarehouseMessage: "ไม่พบ warehouse_id จากตำบลของเจ้าของงาน",
+    },
+    SHIPPER: {
+      sql: `
+        SELECT ma.warehouse_id
+        FROM mm_shippers s
+        LEFT JOIN mm_master_addresses ma
+          ON ma.subdistrict_id = s.subdistrict_id
+        WHERE s.shipper_id = ?
+        LIMIT 1
+      `,
+      notFoundMessage: "ไม่พบข้อมูลผู้ส่ง",
+      noWarehouseMessage: "ไม่พบ warehouse_id จากตำบลของผู้ส่ง",
+    },
+  };
+
+  const source = sourceQueries[pickupSource];
+  const cleanSourceId = toNumberOrNull(sourceId);
+
+  if (!source || !cleanSourceId) {
+    throw new Error("ข้อมูลจุดรับสินค้าไม่ถูกต้อง");
+  }
+
+  const [rows] = await conn.query(source.sql, [cleanSourceId]);
+
+  if (rows.length === 0) {
+    throw new Error(source.notFoundMessage);
+  }
+
+  if (!rows[0].warehouse_id) {
+    throw new Error(source.noWarehouseMessage);
+  }
+
+  return rows[0].warehouse_id;
+};
+
 /**
  * รับ packageRows จาก frontend แล้วกรองเฉพาะรายการที่มี package + detail จริง
  */
@@ -285,9 +333,11 @@ export const insertCreateReceiveSerials = async (
   sourceType = "WEB",
   now,
   assignedWarehouseId,
+  productTable = "tm_product_customers",
 ) => {
   const cleanReceiveId = toNumberOrNull(receiveId);
   const cleanAssignedWarehouseId = toNumberOrNull(assignedWarehouseId);
+  const allowedProductTables = new Set(["tm_product_customers", "tm_product_shippers"]);
 
   if (!cleanReceiveId) {
     throw createReceiveError(
@@ -296,7 +346,11 @@ export const insertCreateReceiveSerials = async (
   }
 
   if (!cleanAssignedWarehouseId) {
-    throw createReceiveError("assigned_warehouse_id required for tm_product_customers");
+    throw createReceiveError("assigned_warehouse_id required");
+  }
+
+  if (!allowedProductTables.has(productTable)) {
+    throw createReceiveError("product table is not supported");
   }
 
   await conn.query(
@@ -463,7 +517,7 @@ export const insertCreateReceiveSerials = async (
 
   await conn.query(
     `
-      INSERT INTO tm_product_customers (
+      INSERT INTO ${productTable} (
         serial_id,
         serial_no,
         customer_id,

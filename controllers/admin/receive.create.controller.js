@@ -8,6 +8,7 @@ import {
   generateReceiveCode,
   getFromWarehouseIdByShipper,
   getToWarehouseIdByRecipientDetail,
+  getPickupAssignedWarehouseId,
   normalizePackageRows,
   buildReceiveDetailData,
   buildReceiveDetailItems,
@@ -43,6 +44,8 @@ export const createReceive = async (req, res) => {
 
     const recipientDetailId = toNumberOrNull(receiveHeader.recipient_detail_id);
     const assignedWarehouseId = toNumberOrNull(receiveHeader.assigned_warehouse_id);
+    const finalIsPickupCustomer = toYN(receiveHeader.is_pickup_customer) === "Y" ? "Y" : "N";
+    const finalIsPickupShipper = toYN(receiveHeader.is_pickup_shipper) === "Y" ? "Y" : "N";
 
     if (!finalCustomerId) {
       return res.status(400).json({
@@ -68,7 +71,13 @@ export const createReceive = async (req, res) => {
       });
     }
 
-    if (!assignedWarehouseId) {
+    if (finalIsPickupCustomer === "Y" && finalIsPickupShipper === "Y") {
+      return res.status(400).json({
+        message: "เลือกจุดรับพัสดุได้เพียงหนึ่งจุดเท่านั้น (ลูกค้าหรือผู้ส่ง)",
+      });
+    }
+
+    if (finalIsPickupCustomer === "N" && finalIsPickupShipper === "N" && !assignedWarehouseId) {
       return res.status(400).json({
         message: "กรุณาเลือกคลังดูแลงาน",
       });
@@ -106,10 +115,14 @@ export const createReceive = async (req, res) => {
 
     const finalIsDocumentReturn = toYN(receiveHeader.is_document_return);
 
-    // ติ๊กเอกสารรับกลับได้ แต่ไม่บังคับเลือก dropdown
-    // Y + ไม่เลือก = null
-    // Y + เลือก = id
-    // N = null
+    const pickupSource = finalIsPickupCustomer === "Y" ? "CUSTOMER" : finalIsPickupShipper === "Y" ? "SHIPPER" : null;
+    const pickupAssignedWarehouseId = pickupSource
+      ? await getPickupAssignedWarehouseId(conn, pickupSource, pickupSource === "CUSTOMER" ? finalCustomerId : shipperId)
+      : null;
+
+    const finalAssignedWarehouseId = pickupAssignedWarehouseId || assignedWarehouseId;
+    const productTable = pickupSource ? "tm_product_shippers" : "tm_product_customers";
+
     const finalDocumentReturnId =
       finalIsDocumentReturn === "Y" ? toNumberOrNull(receiveHeader.document_return_id ?? receiveHeader.document_return) : null;
 
@@ -147,6 +160,9 @@ export const createReceive = async (req, res) => {
       cod: finalIsCod === "Y" ? toNumberOrZero(receiveHeader.cod) : 0,
 
       is_document_return: finalIsDocumentReturn,
+
+      is_pickup_customer: finalIsPickupCustomer,
+      is_pickup_shipper: finalIsPickupShipper,
 
       document_return_id: finalDocumentReturnId,
 
@@ -273,7 +289,7 @@ export const createReceive = async (req, res) => {
     | customer_type = BUSINESS
     |--------------------------------------------------------------------------
     */
-    await insertCreateReceiveSerials(conn, receiveId, "WEB", now, assignedWarehouseId);
+    await insertCreateReceiveSerials(conn, receiveId, "WEB", now, finalAssignedWarehouseId, productTable);
 
     await insertCreateProductTransactions({
       conn,
