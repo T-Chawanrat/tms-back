@@ -29,6 +29,46 @@ import {
   insertImportProductTransactions,
 } from "../../services/receive-import.js";
 import { insertReceiveCreationLog } from "../../services/receive-creation-log.js";
+import { getPickupAssignment } from "../../services/receive.js";
+
+const getDeletedPickupRoute = async (conn, pickupSource, sourceId) => {
+  const sources = {
+    CUSTOMER: {
+      sql: `
+        SELECT route.route_code, route.route_name
+        FROM mm_customers customer
+        INNER JOIN mm_route_details route_detail
+          ON route_detail.subdistrict_id = customer.subdistrict_id
+        INNER JOIN mm_routes route
+          ON route.route_id = route_detail.route_id
+        WHERE customer.id = ?
+          AND route.is_deleted = 'Y'
+        ORDER BY route.route_code, route.route_name
+        LIMIT 1
+      `,
+    },
+    SHIPPER: {
+      sql: `
+        SELECT route.route_code, route.route_name
+        FROM mm_shippers shipper
+        INNER JOIN mm_route_details route_detail
+          ON route_detail.subdistrict_id = shipper.subdistrict_id
+        INNER JOIN mm_routes route
+          ON route.route_id = route_detail.route_id
+        WHERE shipper.shipper_id = ?
+          AND route.is_deleted = 'Y'
+        ORDER BY route.route_code, route.route_name
+        LIMIT 1
+      `,
+    },
+  };
+
+  const source = sources[pickupSource];
+  if (!source) return null;
+
+  const [rows] = await conn.query(source.sql, [sourceId]);
+  return rows[0] || null;
+};
 
 export const importReceivesFromExcel = async (req, res) => {
   const conn = await db.getConnection();
@@ -56,13 +96,6 @@ export const importReceivesFromExcel = async (req, res) => {
       });
     }
 
-    if (!assignedWarehouseId) {
-      return res.status(400).json({
-        success: false,
-        message: "กรุณาเลือกคลังดูแลงานก่อนนำเข้า",
-      });
-    }
-
     const userId = getRequestUserId(req);
 
     importId = await createImportLog({
@@ -73,7 +106,7 @@ export const importReceivesFromExcel = async (req, res) => {
 
     const excelRows = readExcelRows(req.file.buffer);
 
-    const rows = excelRows.map((row, index) => normalizeImportRow(row, index)).filter((row) => !isEmptyImportRow(row));
+    const rows = excelRows.map((row, index) => normalizeImportRow(row, index, true)).filter((row) => !isEmptyImportRow(row));
 
     if (rows.length === 0) {
       const error = new Error("ไม่พบข้อมูลในไฟล์ Excel");
@@ -89,6 +122,10 @@ export const importReceivesFromExcel = async (req, res) => {
         validateError.statusCode = 400;
         throw validateError;
       }
+    }
+
+    if (!assignedWarehouseId && rows.some((row) => row.pickup === "N")) {
+      throw Object.assign(new Error("กรุณาเลือกคลังดูแลงานก่อนนำเข้า"), { statusCode: 400 });
     }
 
     const groupedRows = groupRowsByNoBill(rows);
@@ -109,6 +146,7 @@ export const importReceivesFromExcel = async (req, res) => {
     const addressCache = new Map();
     const shipperCache = new Map();
     const packageCache = new Map();
+    const pickupCache = new Map();
 
     const receiveCodeByNoBill = await buildReceiveCodeMapByNoBill({
       conn,
@@ -135,6 +173,28 @@ export const importReceivesFromExcel = async (req, res) => {
 
       const shipperAddress = await getMasterAddressBySubdistrictId(conn, shipper.subdistrict_id, addressCache);
 
+      const pickupSource = firstRow.pickup === "N" ? null : firstRow.pickup;
+      const pickupId = pickupSource === "CUSTOMER" ? customerId : shipper.shipper_id;
+      const pickupKey = `${pickupSource}:${pickupId}`;
+      if (pickupSource && !pickupCache.has(pickupKey)) {
+        pickupCache.set(pickupKey, await getPickupAssignment(conn, pickupSource, pickupId));
+      }
+      const pickupAssignment = pickupSource ? pickupCache.get(pickupKey) : null;
+
+      if (pickupSource && !pickupAssignment?.pickup_route_id) {
+        const pickupName = pickupSource === "CUSTOMER" ? "เจ้าของงาน" : "ผู้ส่ง";
+        const deletedRoute = await getDeletedPickupRoute(conn, pickupSource, pickupId);
+        const deletedRouteLabel = [deletedRoute?.route_code, deletedRoute?.route_name].filter(Boolean).join(" - ");
+        const message = deletedRouteLabel
+          ? `แถว ${firstRow.row_no}: สายรถเข้ารับ ${deletedRouteLabel} ของ${pickupName}ถูกปิดใช้งาน กรุณาเปิดใช้งานหรือกำหนดสายรถใหม่ก่อนนำเข้า`
+          : `แถว ${firstRow.row_no}: ยังไม่ได้กำหนดสายรถเข้ารับให้${pickupName} กรุณากำหนดสายรถก่อนนำเข้า`;
+
+        throw Object.assign(
+          new Error(message),
+          { statusCode: 400 },
+        );
+      }
+
       const receiveCode = receiveCodeByNoBill.get(noBill);
 
       if (!receiveCode) {
@@ -153,6 +213,7 @@ export const importReceivesFromExcel = async (req, res) => {
         importDate,
         importId,
         now,
+        enablePickup: true,
       });
 
       const { sql, values } = buildInsertSql("tm_receive_import_head", data);
@@ -211,7 +272,7 @@ export const importReceivesFromExcel = async (req, res) => {
         }
       }
 
-      await insertImportReceiveSerials(conn, receiveId, now, assignedWarehouseId);
+      await insertImportReceiveSerials(conn, receiveId, now, pickupAssignment?.warehouse_id ?? assignedWarehouseId, pickupSource ? "tm_product_shippers" : "tm_product_customers", pickupAssignment?.pickup_route_id);
 
       await insertImportProductTransactions({
         conn,

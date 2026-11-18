@@ -71,7 +71,7 @@ const isValueInRange = (value, min, max) => {
   return cleanValue >= cleanMin && cleanValue <= cleanMax;
 };
 
-export const normalizeImportRow = (row, rowIndex) => {
+export const normalizeImportRow = (row, rowIndex, enablePickup = false) => {
   return {
     row_no: rowIndex + 2,
 
@@ -94,6 +94,7 @@ export const normalizeImportRow = (row, rowIndex) => {
 
     is_cod: normalizeYN(row.IS_COD),
     cod: toNumberOrZero(row.COD),
+    pickup: enablePickup ? String(row.PICKUP ?? "").trim().toUpperCase() || "N" : "N",
 
     note: cleanOptionalText(row.NOTE),
 
@@ -194,6 +195,8 @@ export const groupRowsByNoBill = (rows) => {
 export const validateImportHeadRow = (row) => {
   if (!row.no_bill) return `แถว ${row.row_no}: ไม่พบ NO_BILL`;
 
+  if (!["N", "CUSTOMER", "SHIPPER"].includes(row.pickup)) return `แถว ${row.row_no}: PICKUP ต้องเป็น N, CUSTOMER หรือ SHIPPER`;
+
   if (!row.send_date) return `แถว ${row.row_no}: ไม่พบ SEND_DATE`;
 
   if (!parseExcelDate(row.send_date)) {
@@ -246,6 +249,7 @@ export const validateSameBillHeader = (rows) => {
     "payment_type_id",
     "is_cod",
     "cod",
+    "pickup",
   ];
 
   for (const row of rows) {
@@ -531,7 +535,7 @@ export const updateImportLogFailed = async ({ conn, importId, queueTotal, queueP
   );
 };
 
-export const buildImportHeadData = ({ row, customerId, shipper, receiveCode, recipientAddress, shipperAddress, importDate, importId, now }) => {
+export const buildImportHeadData = ({ row, customerId, shipper, receiveCode, recipientAddress, shipperAddress, importDate, importId, now, enablePickup = false }) => {
   const deliveryDate = parseExcelDate(row.send_date);
 
   if (!deliveryDate) {
@@ -562,6 +566,10 @@ export const buildImportHeadData = ({ row, customerId, shipper, receiveCode, rec
 
     is_document_return: row.is_document_return,
     document_return: row.document_return_code,
+    ...(enablePickup ? {
+      is_pickup_customer: row.pickup === "CUSTOMER" ? "Y" : "N",
+      is_pickup_shipper: row.pickup === "SHIPPER" ? "Y" : "N",
+    } : {}),
 
     payment_type_id: row.payment_type_id,
 
@@ -825,7 +833,7 @@ export const insertImportReceiveReference = async ({ conn, referenceNo, receiveI
   await conn.query(sql, values);
 };
 
-export const insertImportReceiveSerials = async (conn, receiveId, now, assignedWarehouseId) => {
+export const insertImportReceiveSerials = async (conn, receiveId, now, assignedWarehouseId, productTable = "tm_product_customers", pickupRouteId = null) => {
   const cleanReceiveId = toNumberOrNull(receiveId);
   const cleanAssignedWarehouseId = toNumberOrNull(assignedWarehouseId);
 
@@ -835,6 +843,10 @@ export const insertImportReceiveSerials = async (conn, receiveId, now, assignedW
 
   if (!cleanAssignedWarehouseId) {
     throw createImportError("assigned_warehouse_id required for tm_product_customers");
+  }
+
+  if (!["tm_product_customers", "tm_product_shippers"].includes(productTable)) {
+    throw createImportError("product table is not supported");
   }
 
   await conn.query(
@@ -1003,11 +1015,12 @@ export const insertImportReceiveSerials = async (conn, receiveId, now, assignedW
 
   await conn.query(
     `
-      INSERT INTO tm_product_customers (
+      INSERT INTO ${productTable} (
         serial_id,
         serial_no,
         customer_id,
         shipper_id,
+        ${productTable === "tm_product_shippers" ? "pickup_route_id," : ""}
         assigned_warehouse_id,
         to_warehouse_id
       )
@@ -1016,6 +1029,7 @@ export const insertImportReceiveSerials = async (conn, receiveId, now, assignedW
         receive_serial.serial_no,
         receive_serial.customer_id,
         receive_serial.shipper_id,
+        ${productTable === "tm_product_shippers" ? "?," : ""}
         ?,
         receive_serial.to_warehouse_id
       FROM tm_receive_serials receive_serial
@@ -1024,7 +1038,7 @@ export const insertImportReceiveSerials = async (conn, receiveId, now, assignedW
         AND receive_serial.serial_id IS NOT NULL
         AND NULLIF(TRIM(receive_serial.serial_no), '') IS NOT NULL
     `,
-    [cleanAssignedWarehouseId, cleanReceiveId],
+    [...(productTable === "tm_product_shippers" ? [toNumberOrNull(pickupRouteId)] : []), cleanAssignedWarehouseId, cleanReceiveId],
   );
 };
 

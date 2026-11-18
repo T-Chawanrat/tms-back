@@ -6,8 +6,10 @@ const buildPickupBillsSql = () => `
     'WEB' AS source_type,
     r.receive_id,
     r.receive_code,
+    r.reference_no,
     r.receive_date,
     r.delivery_date,
+    r.remark,
     r.customer_id,
     r.shipper_id,
     r.to_warehouse_id,
@@ -23,8 +25,10 @@ const buildPickupBillsSql = () => `
     'IMPORT' AS source_type,
     h.receive_id,
     h.receive_code,
+    h.reference_no,
     h.receive_date,
     h.delivery_date,
+    h.remark,
     h.customer_id,
     h.shipper_id,
     h.to_warehouse_id,
@@ -38,12 +42,55 @@ const buildPickupBillsSql = () => `
 export const getPickupReceives = async (req, res) => {
   try {
     const page = getPositiveInteger(req.query.page, 1, Number.MAX_SAFE_INTEGER);
-    const limit = getPositiveInteger(req.query.limit, 50, 100);
+    const limit = getPositiveInteger(req.query.limit, 100, 100);
     const offset = (page - 1) * limit;
     const pickupBillsSql = buildPickupBillsSql();
+    const conditions = [];
+    const params = [];
+    const search = String(req.query.search || "").trim();
+    const dateFrom = String(req.query.date_from || "").trim();
+    const dateTo = String(req.query.date_to || "").trim();
+    const customerId = String(req.query.customer_id || "").trim();
+    const warehouseId = String(req.query.warehouse_id || "").trim();
+    const pickupType = String(req.query.pickup_type || "").trim();
+
+    if (search) {
+      conditions.push(`(bill.receive_code LIKE ? OR bill.reference_no LIKE ? OR EXISTS (
+        SELECT 1 FROM tm_receive_serials matched_serial
+        WHERE matched_serial.source_type = bill.source_type
+          AND matched_serial.receive_business_id = bill.receive_id
+          AND COALESCE(matched_serial.item_is_deleted, 'N') = 'N'
+          AND matched_serial.serial_no LIKE ?
+      ))`);
+      params.push(`%${search}%`, `%${search}%`, `%${search}%`);
+    }
+    if (dateFrom) { conditions.push("bill.receive_date >= ?"); params.push(dateFrom); }
+    if (dateTo) { conditions.push("bill.receive_date < DATE_ADD(?, INTERVAL 1 DAY)"); params.push(dateTo); }
+    if (customerId) { conditions.push("bill.customer_id = ?"); params.push(customerId); }
+    if (pickupType === "CUSTOMER") conditions.push("bill.is_pickup_customer = 'Y'");
+    if (pickupType === "SHIPPER") conditions.push("COALESCE(bill.is_pickup_customer, 'N') <> 'Y' AND bill.is_pickup_shipper = 'Y'");
+    if (warehouseId) {
+      conditions.push(`EXISTS (
+        SELECT 1 FROM mm_customers filter_customer
+        LEFT JOIN mm_shippers filter_shipper ON filter_shipper.shipper_id = bill.shipper_id
+        INNER JOIN mm_master_addresses filter_address
+          ON filter_address.subdistrict_id = CASE WHEN bill.is_pickup_customer = 'Y' THEN filter_customer.subdistrict_id ELSE filter_shipper.subdistrict_id END
+          AND filter_address.district_id = CASE WHEN bill.is_pickup_customer = 'Y' THEN filter_customer.district_id ELSE filter_shipper.district_id END
+          AND filter_address.province_id = CASE WHEN bill.is_pickup_customer = 'Y' THEN filter_customer.province_id ELSE filter_shipper.province_id END
+        WHERE filter_customer.id = bill.customer_id AND filter_address.warehouse_id = ?
+      )`);
+      params.push(warehouseId);
+    }
+    const whereSql = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
 
     const [countRows] = await db.query(
-      `SELECT COUNT(*) AS total FROM (${pickupBillsSql}) pickup_bills`,
+      `SELECT COUNT(*) AS total, COALESCE(SUM((
+        SELECT COUNT(DISTINCT rs.serial_no) FROM tm_receive_serials rs
+        WHERE rs.source_type = bill.source_type AND rs.receive_business_id = bill.receive_id
+          AND rs.serial_no IS NOT NULL AND TRIM(rs.serial_no) <> ''
+          AND COALESCE(rs.item_is_deleted, 'N') = 'N'
+      )), 0) AS total_serial FROM (${pickupBillsSql}) bill ${whereSql}`,
+      params,
     );
 
     const [rows] = await db.query(
@@ -52,8 +99,10 @@ export const getPickupReceives = async (req, res) => {
           bill.source_type,
           bill.receive_id,
           bill.receive_code,
+          bill.reference_no,
           bill.receive_date,
           bill.delivery_date,
+          bill.remark,
           bill.customer_id,
           customer.code AS customer_code,
           customer.name AS customer_name,
@@ -76,6 +125,12 @@ export const getPickupReceives = async (req, res) => {
             WHEN bill.is_pickup_shipper = 'Y' THEN shipper.shipper_name
             ELSE NULL
           END AS pickup_name,
+
+          CASE
+            WHEN bill.is_pickup_customer = 'Y' THEN customer.address
+            WHEN bill.is_pickup_shipper = 'Y' THEN shipper.address
+            ELSE NULL
+          END AS pickup_address,
 
           CASE
             WHEN bill.is_pickup_customer = 'Y' THEN customer_address.subdistrict_id
@@ -113,7 +168,11 @@ export const getPickupReceives = async (req, res) => {
             ELSE NULL
           END AS assigned_warehouse_name,
 
-          COALESCE(serials.total_serial, 0) AS total_serial
+          COALESCE(serials.total_serial, 0) AS total_serial,
+          serials.pickup_route_id,
+          pickup_route.route_code AS pickup_route_code,
+          pickup_route.route_name AS pickup_route_name,
+          COALESCE(serials.pickup_route_count, 0) AS pickup_route_count
         FROM (${pickupBillsSql}) bill
         LEFT JOIN mm_customers customer
           ON customer.id = bill.customer_id
@@ -135,21 +194,28 @@ export const getPickupReceives = async (req, res) => {
           ON destination_warehouse.warehouse_id = bill.to_warehouse_id
         LEFT JOIN (
           SELECT
-            source_type,
-            receive_business_id,
-            COUNT(DISTINCT serial_no) AS total_serial
-          FROM tm_receive_serials
-          WHERE serial_no IS NOT NULL
-            AND TRIM(serial_no) <> ''
-            AND COALESCE(item_is_deleted, 'N') = 'N'
-          GROUP BY source_type, receive_business_id
+            rs.source_type,
+            rs.receive_business_id,
+            COUNT(DISTINCT rs.serial_no) AS total_serial,
+            CASE WHEN COUNT(DISTINCT product.pickup_route_id) = 1
+              THEN MIN(product.pickup_route_id) ELSE NULL END AS pickup_route_id,
+            COUNT(DISTINCT product.pickup_route_id) AS pickup_route_count
+          FROM tm_receive_serials rs
+          LEFT JOIN tm_product_shippers product ON product.serial_id = rs.serial_id
+          WHERE rs.serial_no IS NOT NULL
+            AND TRIM(rs.serial_no) <> ''
+            AND COALESCE(rs.item_is_deleted, 'N') = 'N'
+          GROUP BY rs.source_type, rs.receive_business_id
         ) serials
           ON serials.source_type = bill.source_type
           AND serials.receive_business_id = bill.receive_id
+        LEFT JOIN mm_routes pickup_route
+          ON pickup_route.route_id = serials.pickup_route_id
+        ${whereSql}
         ORDER BY bill.receive_date DESC, bill.receive_code DESC
         LIMIT ? OFFSET ?
       `,
-      [limit, offset],
+      [...params, limit, offset],
     );
 
     const total = Number(countRows[0]?.total || 0);
@@ -157,6 +223,7 @@ export const getPickupReceives = async (req, res) => {
     return res.json({
       success: true,
       data: rows,
+      summary: { total_receives: total, total_serial: Number(countRows[0]?.total_serial || 0) },
       pagination: {
         page,
         limit,

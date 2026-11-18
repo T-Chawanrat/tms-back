@@ -126,15 +126,20 @@ export const getToWarehouseIdByRecipientDetail = async (conn, recipientDetailId)
   return rows[0].warehouse_id;
 };
 
-export const getPickupAssignedWarehouseId = async (conn, pickupSource, sourceId) => {
+export const getPickupAssignment = async (conn, pickupSource, sourceId) => {
   const sourceQueries = {
     CUSTOMER: {
       sql: `
-        SELECT ma.warehouse_id
+        SELECT ma.warehouse_id, r.route_id AS pickup_route_id
         FROM mm_customers c
         LEFT JOIN mm_master_addresses ma
           ON ma.subdistrict_id = c.subdistrict_id
+        LEFT JOIN mm_route_details rd
+          ON rd.subdistrict_id = c.subdistrict_id
+        LEFT JOIN mm_routes r
+          ON r.route_id = rd.route_id AND r.is_deleted = 'N'
         WHERE c.id = ?
+        ORDER BY r.route_id IS NULL, r.route_id
         LIMIT 1
       `,
       notFoundMessage: "ไม่พบข้อมูลเจ้าของงาน",
@@ -142,11 +147,16 @@ export const getPickupAssignedWarehouseId = async (conn, pickupSource, sourceId)
     },
     SHIPPER: {
       sql: `
-        SELECT ma.warehouse_id
+        SELECT ma.warehouse_id, r.route_id AS pickup_route_id
         FROM mm_shippers s
         LEFT JOIN mm_master_addresses ma
           ON ma.subdistrict_id = s.subdistrict_id
+        LEFT JOIN mm_route_details rd
+          ON rd.subdistrict_id = s.subdistrict_id
+        LEFT JOIN mm_routes r
+          ON r.route_id = rd.route_id AND r.is_deleted = 'N'
         WHERE s.shipper_id = ?
+        ORDER BY r.route_id IS NULL, r.route_id
         LIMIT 1
       `,
       notFoundMessage: "ไม่พบข้อมูลผู้ส่ง",
@@ -171,7 +181,7 @@ export const getPickupAssignedWarehouseId = async (conn, pickupSource, sourceId)
     throw new Error(source.noWarehouseMessage);
   }
 
-  return rows[0].warehouse_id;
+  return rows[0];
 };
 
 /**
@@ -334,6 +344,7 @@ export const insertCreateReceiveSerials = async (
   now,
   assignedWarehouseId,
   productTable = "tm_product_customers",
+  pickupRouteId = null,
 ) => {
   const cleanReceiveId = toNumberOrNull(receiveId);
   const cleanAssignedWarehouseId = toNumberOrNull(assignedWarehouseId);
@@ -522,6 +533,7 @@ export const insertCreateReceiveSerials = async (
         serial_no,
         customer_id,
         shipper_id,
+        ${productTable === "tm_product_shippers" ? "pickup_route_id," : ""}
         assigned_warehouse_id,
         to_warehouse_id
       )
@@ -530,6 +542,7 @@ export const insertCreateReceiveSerials = async (
         receive_serial.serial_no,
         receive_serial.customer_id,
         receive_serial.shipper_id,
+        ${productTable === "tm_product_shippers" ? "?," : ""}
         ?,
         receive_serial.to_warehouse_id
       FROM tm_receive_serials receive_serial
@@ -538,7 +551,7 @@ export const insertCreateReceiveSerials = async (
         AND receive_serial.serial_id IS NOT NULL
         AND NULLIF(TRIM(receive_serial.serial_no), '') IS NOT NULL
     `,
-    [cleanAssignedWarehouseId, cleanReceiveId, sourceType],
+    [...(productTable === "tm_product_shippers" ? [toNumberOrNull(pickupRouteId)] : []), cleanAssignedWarehouseId, cleanReceiveId, sourceType],
   );
 };
 

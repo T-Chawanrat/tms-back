@@ -8,7 +8,7 @@ import {
   generateReceiveCode,
   getFromWarehouseIdByShipper,
   getToWarehouseIdByRecipientDetail,
-  getPickupAssignedWarehouseId,
+  getPickupAssignment,
   normalizePackageRows,
   buildReceiveDetailData,
   buildReceiveDetailItems,
@@ -116,11 +116,11 @@ export const createReceive = async (req, res) => {
     const finalIsDocumentReturn = toYN(receiveHeader.is_document_return);
 
     const pickupSource = finalIsPickupCustomer === "Y" ? "CUSTOMER" : finalIsPickupShipper === "Y" ? "SHIPPER" : null;
-    const pickupAssignedWarehouseId = pickupSource
-      ? await getPickupAssignedWarehouseId(conn, pickupSource, pickupSource === "CUSTOMER" ? finalCustomerId : shipperId)
+    const pickupAssignment = pickupSource
+      ? await getPickupAssignment(conn, pickupSource, pickupSource === "CUSTOMER" ? finalCustomerId : shipperId)
       : null;
 
-    const finalAssignedWarehouseId = pickupAssignedWarehouseId || assignedWarehouseId;
+    const finalAssignedWarehouseId = pickupAssignment?.warehouse_id || assignedWarehouseId;
     const productTable = pickupSource ? "tm_product_shippers" : "tm_product_customers";
 
     const finalDocumentReturnId =
@@ -289,7 +289,7 @@ export const createReceive = async (req, res) => {
     | customer_type = BUSINESS
     |--------------------------------------------------------------------------
     */
-    await insertCreateReceiveSerials(conn, receiveId, "WEB", now, finalAssignedWarehouseId, productTable);
+    await insertCreateReceiveSerials(conn, receiveId, "WEB", now, finalAssignedWarehouseId, productTable, pickupAssignment?.pickup_route_id);
 
     await insertCreateProductTransactions({
       conn,
