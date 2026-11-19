@@ -9,6 +9,7 @@ import {
   getFromWarehouseIdByShipper,
   getToWarehouseIdByRecipientDetail,
   getPickupAssignment,
+  validatePickupRoute,
   normalizePackageRows,
   buildReceiveDetailData,
   buildReceiveDetailItems,
@@ -119,6 +120,10 @@ export const createReceive = async (req, res) => {
     const pickupAssignment = pickupSource
       ? await getPickupAssignment(conn, pickupSource, pickupSource === "CUSTOMER" ? finalCustomerId : shipperId)
       : null;
+
+    if (pickupSource) {
+      await validatePickupRoute(conn, pickupSource, pickupSource === "CUSTOMER" ? finalCustomerId : shipperId, pickupAssignment);
+    }
 
     const finalAssignedWarehouseId = pickupAssignment?.warehouse_id || assignedWarehouseId;
     const productTable = pickupSource ? "tm_product_shippers" : "tm_product_customers";

@@ -184,6 +184,30 @@ export const getPickupAssignment = async (conn, pickupSource, sourceId) => {
   return rows[0];
 };
 
+export const validatePickupRoute = async (conn, pickupSource, sourceId, assignment) => {
+  if (assignment?.pickup_route_id) return;
+
+  const source = pickupSource === "CUSTOMER"
+    ? { table: "mm_customers", id: "id", label: "เจ้าของงาน" }
+    : { table: "mm_shippers", id: "shipper_id", label: "ผู้ส่ง" };
+  const [rows] = await conn.query(
+    `SELECT route.route_code, route.route_name
+     FROM ${source.table} pickup
+     INNER JOIN mm_route_details detail ON detail.subdistrict_id = pickup.subdistrict_id
+     INNER JOIN mm_routes route ON route.route_id = detail.route_id AND route.is_deleted = 'Y'
+     WHERE pickup.${source.id} = ?
+     ORDER BY route.route_code, route.route_name
+     LIMIT 1`,
+    [sourceId],
+  );
+  const routeLabel = [rows[0]?.route_code, rows[0]?.route_name].filter(Boolean).join(" - ");
+  const message = rows.length
+    ? `สายรถเข้ารับ${routeLabel ? ` ${routeLabel}` : ""} ของ${source.label}ถูกปิดใช้งาน กรุณาเปิดใช้งานหรือกำหนดสายรถใหม่ก่อนสร้างบิล`
+    : `ยังไม่ได้กำหนดสายรถเข้ารับให้${source.label} กรุณากำหนดสายรถก่อนสร้างบิล`;
+
+  throw Object.assign(new Error(message), { statusCode: 400 });
+};
+
 /**
  * รับ packageRows จาก frontend แล้วกรองเฉพาะรายการที่มี package + detail จริง
  */
